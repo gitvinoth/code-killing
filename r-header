@@ -1,0 +1,11 @@
+col_name	data_type	comment
+rule_id	int	null
+rule_name	string	null
+tenant_id	string	null
+severity	string	null
+join_condition	string	null
+condition_group_id	int	null
+risk_register_controls	array<int>	null
+conditions	string	null
+rule_run_frequency	int	null
+last_updated_date	timestamp	null
