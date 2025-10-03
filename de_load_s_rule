@@ -1,0 +1,725 @@
+# Databricks notebook source
+from datetime import datetime
+from delta.tables import DeltaTable
+from pyspark.sql.functions import (
+    input_file_name,
+    split,
+    lit,
+    explode,
+    col,
+    when,
+    concat_ws,
+    lower,
+    trim,
+    udf,
+    array,
+    expr,
+    row_number,
+    desc,
+    substring,
+    concat,
+    regexp_replace,
+    max,
+    collect_list,
+    monotonically_increasing_id,
+    coalesce,
+    current_timestamp,
+    to_json,
+    array_max,
+    map_keys,
+    map_values,
+)
+from pyspark.sql.window import Window
+from pyspark.sql.types import (
+    StructType,
+    StructField,
+    IntegerType,
+    StringType,
+    ArrayType,
+    DoubleType,
+    MapType,
+)
+
+# COMMAND ----------
+
+# MAGIC %run ../utils/logger
+
+# COMMAND ----------
+
+# MAGIC %run ../utils/read_utility
+
+# COMMAND ----------
+
+# MAGIC %run ../utils/write_utility
+
+# COMMAND ----------
+
+# MAGIC %run ../utils/file_metadata_utility
+
+# COMMAND ----------
+
+try:
+    if dbutils:
+        pass  # pragma: no cover
+except NameError:
+    from src.utils.file_metadata_utility import add_epoch_timestamp
+    from src.utils.read_utility import read_json, read_delta_table, read_table
+    from src.utils.write_utility import write_table
+
+# COMMAND ----------
+
+# Statistical function mapping
+STATISTICAL_FUNCTION_MAPPING = {
+    "z-score": "zscore",
+    "z_score": "zscore",
+    "zscore": "zscore",
+    "moving_average": "moving_avg",
+    "moving average": "moving_avg",
+    "exponential_smoothing": "exp_smooth",
+    "exponential smoothing": "exp_smooth",
+}
+
+# COMMAND ----------
+
+def get_statistical_rules_df(spark, logger, source_file_list):
+    """
+    Reads statistical rules from JSON files and returns a dataframe.
+    """
+    try:
+        logger.info(f"Reading the source files: {source_file_list}")
+        
+        conditions_schema = StructType([
+            StructField("condition_id", IntegerType(), True),
+            StructField("condition_name", StringType(), True),
+            StructField("asset_id", ArrayType(StringType()), True),
+            StructField("asset_parameters", MapType(StringType(), ArrayType(StringType())), True),
+            StructField("join_condition", StringType(), True),
+            StructField("operator", StringType(), True),
+            StructField("class", IntegerType(), True),
+            StructField("threshold", DoubleType(), True),
+            StructField("duration", IntegerType(), True),
+            StructField("wire", StringType(), True),
+            StructField("function", StringType(), True),
+            StructField("wireLengthFrom", IntegerType(), True),
+            StructField("wireLengthTo", IntegerType(), True),
+            StructField("rule_run_frequency", IntegerType(), True),
+            StructField("sensor_type", StringType(), True),
+            StructField("severity", StringType(), True),
+            StructField("baseline_time", IntegerType(), True),
+            StructField("threshold_unit", StringType(), True),
+            StructField("additional_properties", MapType(StringType(), IntegerType()), True),
+            StructField("risk_register_controls", ArrayType(IntegerType()), True),
+            StructField("path", StringType(), True),
+        ])
+
+        schema = StructType([
+            StructField("rule_id", IntegerType(), True),
+            StructField("rule_name", StringType(), True),
+            StructField("rule_type", StringType(), True),
+            StructField("tenant_id", StringType(), True),
+            StructField("conditions", ArrayType(conditions_schema), True),
+            StructField("operation", StringType(), True),
+        ])
+
+        rules_df = read_json(spark, logger, source_file_list, schema).withColumn(
+            "input_file", input_file_name()
+        )
+
+        return rules_df
+
+    except Exception as e:
+        logger.error(f"Error in get_statistical_rules_df(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def keep_latest_statistical_rules(logger, rules_df):
+    """
+    Keeps only the latest record for each rule_id based on epoch timestamp 
+    extracted from file name.
+    """
+    try:
+        rules_df = add_epoch_timestamp(logger, rules_df)
+        window_spec = Window.partitionBy("rule_id").orderBy(desc("epoch_timestamp"))
+
+        rules_df = (
+            rules_df.withColumn("row_num", row_number().over(window_spec))
+            .where(col("row_num") == 1)
+            .drop("row_num", "epoch_timestamp")
+        )
+
+        return rules_df
+
+    except Exception as e:
+        logger.error(f"Error in keep_latest_statistical_rules(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def delete_statistical_rules(spark, logger, rules_df, bronze_table_name):
+    """
+    Deletes rules from the statistical_rules bronze table for records 
+    with operation as delete.
+    """
+    try:
+        rules_delete_df = rules_df.filter(
+            lower(trim(col("operation"))) == "delete"
+        ).distinct()
+
+        if rules_delete_df.count() > 0:
+            logger.info("Found rules to Delete. Deleting the rules from delta table...")
+            rules_dt = read_delta_table(spark, logger, bronze_table_name)
+
+            (
+                rules_dt.alias("target")
+                .merge(
+                    rules_delete_df.alias("source"), 
+                    "target.rule_id = source.rule_id"
+                )
+                .whenMatchedDelete()
+                .execute()
+            )
+        else:
+            logger.info("No rules to delete...")
+
+    except Exception as e:
+        logger.error(f"Error in delete_statistical_rules(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def explode_statistical_conditions(logger, rules_df):
+    """
+    Explodes conditions and extracts all fields including asset_parameters,
+    additional_properties, and path.
+    """
+    try:
+        logger.info("Extracting the create/update rules...")
+        create_update_rules_df = rules_df.filter(
+            col("operation") != "delete"
+        ).distinct()
+
+        logger.info("Exploding conditions column and extracting values...")
+        create_update_rules_df = (
+            create_update_rules_df
+            .withColumn("conditions", explode(col("conditions")))
+            .withColumn("condition_id", col("conditions.condition_id"))
+            .withColumn("condition_name", col("conditions.condition_name"))
+            .withColumn("asset_id", col("conditions.asset_id"))
+            .withColumn("asset_parameter", col("conditions.asset_parameters"))
+            .withColumn("join_condition", col("conditions.join_condition"))
+            .withColumn("operator", col("conditions.operator"))
+            .withColumn("class", col("conditions.class"))
+            .withColumn("threshold", col("conditions.threshold"))
+            .withColumn("duration", col("conditions.duration"))
+            .withColumn("wire", col("conditions.wire"))
+            .withColumn("function", col("conditions.function"))
+            .withColumn("wire_length_from", col("conditions.wireLengthFrom"))
+            .withColumn("wire_length_to", col("conditions.wireLengthTo"))
+            .withColumn("rule_run_frequency", col("conditions.rule_run_frequency"))
+            .withColumn("sensor_type", col("conditions.sensor_type"))
+            .withColumn("severity", col("conditions.severity"))
+            .withColumn("baseline_time", col("conditions.baseline_time"))
+            .withColumn("threshold_unit", col("conditions.threshold_unit"))
+            .withColumn("additional_properties", col("conditions.additional_properties"))
+            .withColumn("risk_register_controls", col("conditions.risk_register_controls"))
+            .withColumn("path", col("conditions.path"))
+            .withColumn("query", lit("query"))  # Placeholder for query generation
+            .withColumn("last_updated_date", current_timestamp())
+            .drop("conditions")
+        )
+
+        return create_update_rules_df
+
+    except Exception as e:
+        logger.error(f"Error in explode_statistical_conditions(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def apply_join_condition_statistical(logger, rules_df):
+    """
+    Applies join condition logic for statistical rules.
+    For OR condition: explodes asset_id array
+    For AND condition: keeps asset_id as array
+    """
+    try:
+        # Normalize join_condition
+        rules_df = rules_df.withColumn(
+            "join_condition",
+            when(
+                col("join_condition").isNull() | (lower(col("join_condition")) == ""),
+                "or"
+            ).otherwise(lower(trim(col("join_condition"))))
+        )
+
+        logger.info("Applying join condition logic...")
+        
+        # For OR condition: explode asset_id (each asset gets its own row)
+        rules_or_df = rules_df.filter(
+            col("join_condition") == "or"
+        ).withColumn("asset_id_temp", explode(col("asset_id")))
+        
+        # For AND condition: keep asset_id as array
+        rules_and_df = rules_df.filter(
+            col("join_condition") == "and"
+        )
+
+        # Union back together
+        if rules_or_df.count() > 0 and rules_and_df.count() > 0:
+            # For OR, replace asset_id with single exploded value
+            rules_or_df = rules_or_df.withColumn(
+                "asset_id", array(col("asset_id_temp"))
+            ).drop("asset_id_temp")
+            
+            result_df = rules_and_df.unionByName(rules_or_df)
+        elif rules_or_df.count() > 0:
+            result_df = rules_or_df.withColumn(
+                "asset_id", array(col("asset_id_temp"))
+            ).drop("asset_id_temp")
+        else:
+            result_df = rules_and_df
+
+        return result_df
+
+    except Exception as e:
+        logger.error(f"Error in apply_join_condition_statistical(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def get_statistical_rules_to_upsert(logger, rules_df, rules_dt):
+    """
+    Returns dataframe containing rules that need to be created/inserted and updated.
+    Only retains rules with create operation which are not present in the 
+    statistical_rules bronze table.
+    """
+    try:
+        rules_dt_df = rules_dt.toDF()
+
+        logger.info(
+            "Filtering rules where operation is 'create' and rule_id is not present in bronze table..."
+        )
+
+        create_src = rules_df.filter(lower(trim(col("operation"))) == "create")
+
+        rules_create_df = create_src.join(
+            rules_dt_df, 
+            create_src.rule_id == rules_dt_df.rule_id, 
+            how="left_anti"
+        )
+        
+        logger.info("Filtering rules where operation is 'update'...")
+        rules_update_df = rules_df.filter(lower(trim(col("operation"))) == "update")
+
+        return rules_create_df.unionByName(rules_update_df)
+
+    except Exception as e:
+        logger.error(f"Error in get_statistical_rules_to_upsert(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def add_data_frequency_statistical(logger, rules_df, asset_df):
+    """
+    Adds data_frequency column from asset bronze table to the rules dataframe.
+    """
+    try:
+        logger.info("Fetching asset_id and data_frequency from asset bronze table...")
+        asset_df = asset_df.select(
+            col("asset_id"), 
+            col("data_frequency")
+        ).withColumn(
+            "data_frequency", 2 * col("data_frequency") - 1
+        )
+
+        logger.info("Adding unique id to each row of rules...")
+        rules_df = rules_df.withColumn("id", monotonically_increasing_id())
+
+        # Explode the asset_id array
+        exploded_rules_df = rules_df.select(
+            "id", explode("asset_id").alias("asset_id")
+        )
+
+        logger.info("Joining rules and asset data based on asset_id...")
+        joined_df = exploded_rules_df.join(asset_df, on="asset_id", how="left")
+
+        logger.info("Collecting data frequency in a list...")
+        result_df = joined_df.groupBy("id").agg(
+            collect_list("data_frequency").alias("data_frequency"),
+            ((max("data_frequency") + 1) / 2).cast("integer").alias("max_data_frequency")
+        )
+
+        logger.info("Adding data_frequency column...")
+        result_df = rules_df.join(result_df, on="id", how="inner")
+
+        result_df = result_df.withColumn(
+            "window_slide_duration",
+            when(col("function").isin(["moving_average", "exponential_smoothing"]), 
+                 col("duration"))
+            .otherwise(lit(0))
+        )
+
+        return result_df
+
+    except Exception as e:
+        logger.error(f"Error in add_data_frequency_statistical(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def generate_statistical_query(logger, rules_df):
+    """
+    Generates statistical query based on function type and parameters.
+    For script-based rules, the query references the Python script path.
+    """
+    try:
+        logger.info("Generating statistical queries...")
+        
+        # For script-based rules, create a reference query
+        rules_df = rules_df.withColumn(
+            "query",
+            when(
+                col("rule_type") == "script",
+                concat(
+                    lit("EXECUTE_SCRIPT('"),
+                    col("path"),
+                    lit("', asset_id="),
+                    concat_ws(",", col("asset_id")),
+                    lit(", parameters="),
+                    to_json(col("asset_parameter")),
+                    lit(", additional_properties="),
+                    to_json(col("additional_properties")),
+                    lit("')")
+                )
+            ).otherwise(
+                concat(
+                    lit("STATISTICAL_FUNCTION('"),
+                    col("function"),
+                    lit("', asset_id="),
+                    concat_ws(",", col("asset_id")),
+                    lit(", threshold="),
+                    col("threshold"),
+                    lit(", duration="),
+                    col("duration"),
+                    lit("')")
+                )
+            )
+        )
+
+        return rules_df
+
+    except Exception as e:
+        logger.error(f"Error in generate_statistical_query(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def log_error_statistical_rules(
+    logger,
+    error_rules_df,
+    bronze_error_log,
+    job_id,
+    run_id,
+    task_id,
+    workflow_name,
+    task_name,
+):
+    """
+    Logs malformed statistical rules in the error log table.
+    """
+    try:
+        if error_rules_df.count() == 0:
+            logger.info("No error rules to log...")
+            return
+
+        error_rules_df = (
+            error_rules_df.select("asset_id", "input_file", "rule_id")
+            .withColumn("workflow_job_id", lit(job_id))
+            .withColumn("run_id", lit(run_id))
+            .withColumn("task_id", lit(task_id))
+            .withColumn("workflow_name", lit(workflow_name))
+            .withColumn("task_name", lit(task_name))
+            .withColumn("source", col("input_file"))
+            .withColumn(
+                "error_message",
+                concat(
+                    lit("Data Frequency missing in asset table for asset_id(s): "),
+                    concat_ws(", ", col("asset_id")),
+                    lit(" in rule_id: "),
+                    col("rule_id")
+                )
+            )
+            .withColumn("additional_context", lit("Statistical Rule"))
+            .withColumn("last_updated_date", current_timestamp())
+            .drop("asset_id", "input_file", "rule_id")
+        )
+
+        logger.info(f"Writing malformed rules into {bronze_error_log} table...")
+        write_table(logger, error_rules_df, "append", bronze_error_log)
+
+    except Exception as e:
+        logger.error(f"Error in log_error_statistical_rules(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def delete_statistical_rules_with_update(logger, rules_df, rules_dt):
+    """
+    Deletes rules from bronze table where operation is 'update'.
+    Update is treated as delete and insert.
+    """
+    try:
+        logger.info(
+            "Deleting the rules from bronze table where operation == 'update'..."
+        )
+
+        (
+            rules_dt.alias("tgt")
+            .merge(
+                rules_df.alias("src"),
+                "src.rule_id = tgt.rule_id and src.operation = 'update'",
+            )
+            .whenMatchedDelete()
+            .execute()
+        )
+
+    except Exception as e:
+        logger.error(f"Error in delete_statistical_rules_with_update(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def write_statistical_rules(logger, rules_df, bronze_table_name):
+    """
+    Writes statistical rules to the bronze table.
+    """
+    try:
+        logger.info("Removing temporary columns...")
+        rules_df = rules_df.drop(
+            "operation", "id", "data_frequency", "input_file", "rule_type"
+        )
+
+        logger.info("Rearranging columns to match bronze table schema...")
+        rules_df = rules_df.select(
+            "rule_id",
+            "rule_name",
+            "tenant_id",
+            "condition_id",
+            "condition_name",
+            "asset_id",
+            "asset_parameter",
+            "join_condition",
+            "parameter",
+            "operator",
+            "class",
+            "threshold",
+            "duration",
+            "wire",
+            "function",
+            "wire_length_from",
+            "wire_length_to",
+            "rule_run_frequency",
+            "max_data_frequency",
+            "sensor_type",
+            "severity",
+            "risk_register_controls",
+            "baseline_time",
+            "threshold_unit",
+            "additional_properties",
+            "window_slide_duration",
+            "query",
+            "path",
+            "last_updated_date",
+        )
+
+        logger.info("Inserting statistical rules from source file...")
+        write_table(logger, rules_df, "append", bronze_table_name)
+
+    except Exception as e:
+        logger.error(f"Error in write_statistical_rules(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def create_statistical_rules_header(
+    spark,
+    logger,
+    rules_json_df,
+    bronze_table_name,
+    bronze_statistical_rules_header_table
+):
+    """
+    Creates header table for statistical rules combining relevant fields 
+    for JSON payload to s-bus.
+    """
+    try:
+        logger.info("Creating statistical rules header...")
+        
+        # Filter out delete operations
+        filtered_rules_json_df = rules_json_df.filter(
+            col("operation") != "delete"
+        ).distinct()
+
+        # Extract rule_run_frequency from conditions
+        create_update_rules_json_df = (
+            filtered_rules_json_df
+            .withColumn(
+                "rule_run_frequency_list",
+                expr("transform(conditions, x -> x.rule_run_frequency)")
+            )
+            .withColumn(
+                "rule_run_frequency",
+                array_max(col("rule_run_frequency_list"))
+            )
+            .withColumn(
+                "conditions",
+                to_json(col("conditions"), options={"ignoreNullFields": False})
+            )
+        )
+
+        # Read statistical rules table to get statistical_group_id
+        df_statistical = read_table(spark, logger, bronze_table_name)
+        
+        df_statistical_max = df_statistical.groupBy("rule_id").agg(
+            max("condition_id").alias("statistical_group_id")
+        ).distinct()
+
+        logger.info("Joining with statistical rules to get statistical_group_id...")
+        result_header_df = df_statistical_max.join(
+            create_update_rules_json_df,
+            on="rule_id",
+            how="inner"
+        ).select(
+            "rule_id",
+            "rule_name",
+            "tenant_id",
+            col("conditions.severity").alias("severity"),
+            col("conditions.join_condition").getItem(0).alias("join_condition"),
+            "statistical_group_id",
+            col("conditions.risk_register_controls").getItem(0).alias("risk_register_controls"),
+            col("conditions").alias("conditions"),
+            "rule_run_frequency",
+            current_timestamp().alias("last_updated_date")
+        )
+
+        # Read target delta table
+        target_df = read_delta_table(spark, logger, bronze_statistical_rules_header_table)
+
+        logger.info("Upserting data into statistical_rules_header table...")
+        
+        # Perform merge operation
+        (
+            target_df.alias("target")
+            .merge(
+                result_header_df.alias("source"),
+                "target.rule_id = source.rule_id"
+            )
+            .whenMatchedUpdateAll()
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+
+        logger.info("Data loaded successfully into statistical_rules_header table")
+
+    except Exception as e:
+        logger.error(f"Error in create_statistical_rules_header(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def load_statistical_rules_bronze(
+    spark,
+    logger,
+    source_file_list,
+    bronze_table_name,
+    bronze_asset_table,
+    bronze_error_log,
+    bronze_statistical_rules_header_table,
+    job_id,
+    run_id,
+    task_id,
+    workflow_name,
+    task_name,
+) -> bool:
+    """
+    Main function to load statistical rules into bronze zone.
+    """
+    try:
+        logger.info("Starting statistical rules load process...")
+        
+        # Read JSON files
+        rules_json_df = get_statistical_rules_df(spark, logger, source_file_list)
+
+        if rules_json_df.count() == 0:
+            logger.info("No statistical rules to create/update/delete...")
+            return False
+
+        # Keep latest rules
+        rules_df = keep_latest_statistical_rules(logger, rules_json_df)
+
+        # Delete rules with operation = 'delete'
+        delete_statistical_rules(spark, logger, rules_df, bronze_table_name)
+
+        # Explode conditions
+        rules_df = explode_statistical_conditions(logger, rules_df)
+
+        # Apply join condition
+        rules_df = apply_join_condition_statistical(logger, rules_df)
+
+        if rules_df.count() == 0:
+            logger.info("No statistical rules to create/update...")
+            return True
+
+        # Read delta table
+        rules_dt = read_delta_table(spark, logger, bronze_table_name)
+
+        # Get rules to upsert
+        rules_df = get_statistical_rules_to_upsert(logger, rules_df, rules_dt)
+
+        # Read asset table
+        asset_df = read_table(spark, logger, bronze_asset_table)
+
+        # Add data frequency
+        rules_df = add_data_frequency_statistical(logger, rules_df, asset_df)
+
+        # Separate error records
+        error_rules_df = rules_df.filter(col("data_frequency").isNull())
+        rules_df = rules_df.filter(col("data_frequency").isNotNull())
+
+        # Log errors
+        log_error_statistical_rules(
+            logger,
+            error_rules_df,
+            bronze_error_log,
+            job_id,
+            run_id,
+            task_id,
+            workflow_name,
+            task_name,
+        )
+
+        # Generate queries
+        rules_df = generate_statistical_query(logger, rules_df)
+
+        # Delete rules with update operation
+        delete_statistical_rules_with_update(logger, rules_df, rules_dt)
+
+        # Write rules to bronze
+        write_statistical_rules(logger, rules_df, bronze_table_name)
+
+        # Create header table
+        create_statistical_rules_header(
+            spark,
+            logger,
+            rules_json_df,
+            bronze_table_name,
+            bronze_statistical_rules_header_table
+        )
+
+        logger.info("Statistical rules load process completed successfully")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error in load_statistical_rules_bronze(): {str(e)}")
+        raise
