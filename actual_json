@@ -1,0 +1,38 @@
+rules_json = """
+{
+"rule_id": 1,
+"rule_name": "rule1",
+"rule_type": "script",
+"tenant_id": "20976703-b49e-426f-a654-4632742c6589",
+"join_condition": "AND",
+"conditions": [
+{
+"condition_id": 1,
+"condition_name": "condition1",
+"asset_id": [
+"PTG-001"
+],
+"asset_parameters": {
+"PTG-001": ["pressure","temperature"]
+},
+"operator": ">",
+"class": "null",
+"threshold": 100,
+"duration": 1800,
+"wire": 1,
+"wireLengthFrom": 1000,
+"wireLengthTo": 2000,
+"rule_run_frequency": 1,
+"sensor_type": "dss",
+"severity": "high",
+"function":"z-score",
+"baseline_time":	0,
+"threshold_unit": "psu",
+"additional_properties":{"zscore_threshold": 34},
+"risk_register_controls": [5],
+"path":"/path/to/python"
+}
+],
+"operation": "create"
+}
+"""
