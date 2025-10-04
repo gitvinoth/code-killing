@@ -1,0 +1,40 @@
+from pyspark.sql.functions import from_json, col
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, ArrayType, DoubleType, MapType
+
+conditions_schema = StructType([
+    StructField("condition_id", IntegerType(), True),
+    StructField("condition_name", StringType(), True),
+    StructField("asset_id", ArrayType(StringType()), True),
+    StructField("parameter", ArrayType(StringType()), True),
+    StructField("asset_parameters", MapType(StringType(), ArrayType(StringType())), True),
+    StructField("operator", StringType(), True),
+    StructField("class", IntegerType(), True),
+    StructField("threshold", DoubleType(), True),
+    StructField("duration", IntegerType(), True),
+    StructField("wire", StringType(), True),
+    StructField("function", StringType(), True),
+    StructField("wire_length_from", IntegerType(), True),
+    StructField("wire_length_to", IntegerType(), True),
+    StructField("rule_run_frequency", IntegerType(), True),
+    StructField("sensor_type", StringType(), True),
+    StructField("severity", StringType(), True),
+    StructField("baseline_time", IntegerType(), True),
+    StructField("threshold_unit", StringType(), True),
+    StructField("risk_register_controls", ArrayType(IntegerType()), True),
+    StructField("additional_properties", MapType(StringType(), IntegerType()), True),
+    StructField("path", StringType(), True)
+])
+
+schema = StructType([
+    StructField("rule_id", IntegerType(), True),
+    StructField("rule_name", StringType(), True),
+    StructField("rule_type", StringType(), True),
+    StructField("tenant_id", StringType(), True),
+    StructField("join_condition", StringType(), True),
+    StructField("conditions", ArrayType(conditions_schema), True),
+    StructField("operation", StringType(), True)
+])
+
+rules_df = spark.read.json(sc.parallelize([rules_json]), schema)
+
+display(rules_df)
