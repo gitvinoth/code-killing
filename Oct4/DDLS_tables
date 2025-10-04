@@ -1,0 +1,189 @@
+-- ============================================================================
+-- Statistical Rules Bronze Zone Tables
+-- ============================================================================
+
+-- 1. Main Statistical Rules Table
+-- Stores individual statistical rule records with one row per parameter
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS bronze_zone.statistical_rules (
+    rule_id INT NOT NULL COMMENT 'Unique identifier for the rule',
+    rule_name STRING COMMENT 'Name of the rule',
+    tenant_id STRING COMMENT 'Tenant identifier',
+    condition_id INT COMMENT 'Condition identifier within the rule',
+    condition_name STRING COMMENT 'Name of the condition',
+    asset_id ARRAY<STRING> COMMENT 'Array of asset IDs (single for OR, multiple for AND)',
+    asset_parameter MAP<STRING, ARRAY<STRING>> COMMENT 'Map of asset_id to parameters for this row',
+    join_condition STRING COMMENT 'Join condition: and or or',
+    parameter STRING COMMENT 'Specific parameter for this row (extracted from asset_parameter)',
+    operator STRING COMMENT 'Comparison operator (>, <, =, etc.)',
+    class INT COMMENT 'Class filter for microseismic events',
+    threshold DOUBLE COMMENT 'Threshold value for anomaly detection',
+    duration INT COMMENT 'Duration in seconds for anomaly persistence',
+    wire STRING COMMENT 'Wire number for DSS sensors',
+    function STRING COMMENT 'Statistical function name (z-score, moving_average, etc.)',
+    wire_length_from INT COMMENT 'Starting depth for DSS wire (in meters)',
+    wire_length_to INT COMMENT 'Ending depth for DSS wire (in meters)',
+    rule_run_frequency INT COMMENT 'Frequency to run the rule (in seconds)',
+    max_data_frequency INT COMMENT 'Maximum data frequency across all assets',
+    sensor_type STRING COMMENT 'Type of sensor (pt_gauge, dss, flowmeter, microseismic_events)',
+    severity STRING COMMENT 'Severity level (low, medium, high, critical)',
+    risk_register_controls ARRAY<INT> COMMENT 'Array of risk register control IDs',
+    baseline_time INT COMMENT 'Baseline timestamp for differential comparison',
+    threshold_unit STRING COMMENT 'Unit for threshold (%, psi, std, etc.)',
+    additional_properties MAP<STRING, INT> COMMENT 'Additional configuration properties for statistical functions',
+    window_slide_duration INT COMMENT 'Window slide duration for moving average functions',
+    query STRING COMMENT 'Generated SQL query for data retrieval',
+    path STRING COMMENT 'Path to Python script for custom statistical functions',
+    last_updated_date TIMESTAMP COMMENT 'Timestamp of last update'
+)
+USING DELTA
+PARTITIONED BY (rule_id)
+COMMENT 'Statistical rules table storing individual parameter-level rules';
+
+-- ============================================================================
+-- 2. Statistical Combined Rules Table
+-- Stores execution-ready queries with AND/OR logic applied
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS bronze_zone.statistical_combined_rules (
+    rule_id INT NOT NULL COMMENT 'Unique identifier for the rule',
+    combination_id INT NOT NULL COMMENT 'Unique identifier for each execution combination within a rule',
+    condition_id ARRAY<INT> COMMENT 'Array of condition IDs involved in this combination',
+    asset_id ARRAY<STRING> COMMENT 'Array of asset IDs involved in this combination',
+    asset_parameter MAP<STRING, ARRAY<STRING>> COMMENT 'Map of asset_id to parameters for this combination',
+    parameter ARRAY<STRING> COMMENT 'Array of all parameters involved in this combination',
+    join_condition STRING COMMENT 'Join condition: and or or',
+    combined_query STRING COMMENT 'Execution-ready query with INTERSECT/UNION logic applied',
+    execution_logic STRING COMMENT 'Execution strategy: INDEPENDENT (OR) or INTERSECT_ALL (AND)',
+    last_updated_date TIMESTAMP COMMENT 'Timestamp of last update'
+)
+USING DELTA
+PARTITIONED BY (rule_id)
+COMMENT 'Statistical combined rules with execution logic for anomaly detection engine';
+
+-- ============================================================================
+-- 3. Statistical Rules Header Table
+-- Stores metadata for S-Bus payload and rule tracking
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS bronze_zone.statistical_rules_header (
+    rule_id INT NOT NULL COMMENT 'Unique identifier for the rule',
+    rule_name STRING COMMENT 'Name of the rule',
+    tenant_id STRING COMMENT 'Tenant identifier',
+    severity STRING COMMENT 'Severity level (low, medium, high, critical)',
+    join_condition STRING COMMENT 'Join condition: and or or',
+    statistical_group_id INT COMMENT 'Maximum condition_id for this rule (grouping identifier)',
+    risk_register_controls ARRAY<INT> COMMENT 'Array of risk register control IDs',
+    conditions STRING COMMENT 'JSON string representation of all conditions for S-Bus payload',
+    rule_run_frequency INT COMMENT 'Maximum rule run frequency across all conditions',
+    last_updated_date TIMESTAMP COMMENT 'Timestamp of last update'
+)
+USING DELTA
+PARTITIONED BY (rule_id)
+COMMENT 'Statistical rules header table for S-Bus payload and metadata';
+
+-- ============================================================================
+-- Sample Queries
+-- ============================================================================
+
+-- View all statistical rules for a specific rule_id
+SELECT 
+    rule_id,
+    condition_id,
+    asset_id,
+    asset_parameter,
+    parameter,
+    join_condition,
+    function,
+    query
+FROM bronze_zone.statistical_rules
+WHERE rule_id = 1
+ORDER BY condition_id, parameter;
+
+-- View execution combinations
+SELECT 
+    rule_id,
+    combination_id,
+    execution_logic,
+    size(asset_id) as num_assets,
+    size(parameter) as num_parameters,
+    join_condition
+FROM bronze_zone.statistical_combined_rules
+WHERE rule_id = 1
+ORDER BY combination_id;
+
+-- View rules grouped by join_condition
+SELECT 
+    join_condition,
+    COUNT(DISTINCT rule_id) as num_rules,
+    COUNT(*) as total_rows,
+    AVG(size(asset_id)) as avg_assets_per_row
+FROM bronze_zone.statistical_rules
+GROUP BY join_condition;
+
+-- Find rules with multiple assets (AND logic)
+SELECT 
+    rule_id,
+    parameter,
+    asset_id,
+    size(asset_id) as asset_count,
+    query
+FROM bronze_zone.statistical_rules
+WHERE size(asset_id) > 1
+ORDER BY rule_id, parameter;
+
+-- View combined queries ready for execution
+SELECT 
+    rule_id,
+    combination_id,
+    execution_logic,
+    combined_query
+FROM bronze_zone.statistical_combined_rules
+WHERE rule_id = 1
+ORDER BY combination_id;
+
+-- ============================================================================
+-- Table Maintenance
+-- ============================================================================
+
+-- Optimize tables
+OPTIMIZE bronze_zone.statistical_rules;
+OPTIMIZE bronze_zone.statistical_combined_rules;
+OPTIMIZE bronze_zone.statistical_rules_header;
+
+-- Vacuum tables (remove old versions)
+VACUUM bronze_zone.statistical_rules RETAIN 168 HOURS;
+VACUUM bronze_zone.statistical_combined_rules RETAIN 168 HOURS;
+VACUUM bronze_zone.statistical_rules_header RETAIN 168 HOURS;
+
+-- Describe table schema
+DESCRIBE EXTENDED bronze_zone.statistical_rules;
+DESCRIBE EXTENDED bronze_zone.statistical_combined_rules;
+DESCRIBE EXTENDED bronze_zone.statistical_rules_header;
+
+-- Show table statistics
+SHOW TABLE EXTENDED IN bronze_zone LIKE 'statistical_rules';
+SHOW TABLE EXTENDED IN bronze_zone LIKE 'statistical_combined_rules';
+SHOW TABLE EXTENDED IN bronze_zone LIKE 'statistical_rules_header';
+
+-- ============================================================================
+-- Example Data Patterns
+-- ============================================================================
+
+-- Example 1: OR Logic - One row per asset:parameter
+-- Input: {"PTG-001": ["pressure"], "PTG-002": ["pressure"]}, join_condition="or"
+-- Output:
+-- Row 1: asset_id=["PTG-001"], asset_parameter={"PTG-001":["pressure"]}, parameter="pressure"
+-- Row 2: asset_id=["PTG-002"], asset_parameter={"PTG-002":["pressure"]}, parameter="pressure"
+
+-- Example 2: AND Logic - Multiple assets per parameter
+-- Input: {"PTG-001": ["pressure"], "PTG-002": ["pressure"]}, join_condition="and"
+-- Output:
+-- Row 1: asset_id=["PTG-001","PTG-002"], asset_parameter={"PTG-001":["pressure"],"PTG-002":["pressure"]}, parameter="pressure"
+
+-- Example 3: AND Logic - Multiple parameters
+-- Input: {"PTG-001": ["pressure","temperature"], "PTG-002": ["temperature"]}, join_condition="and"
+-- Output:
+-- Row 1: asset_id=["PTG-001"], asset_parameter={"PTG-001":["pressure"]}, parameter="pressure"
+-- Row
