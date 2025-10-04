@@ -1,0 +1,1647 @@
+# Databricks notebook source
+from datetime import datetime
+from delta.tables import DeltaTable
+from pyspark.sql.functions import (
+    input_file_name,
+    split,
+    lit,
+    explode,
+    col,
+    when,
+    concat_ws,
+    lower,
+    trim,
+    udf,
+    array,
+    expr,
+    row_number,
+    desc,
+    substring,
+    concat,
+    regexp_replace,
+    max,
+    collect_list,
+    monotonically_increasing_id,
+    coalesce,
+    current_timestamp,
+    to_json,
+    array_max,
+    map_keys,
+    map_values,
+)
+from pyspark.sql.window import Window
+from pyspark.sql.types import (
+    StructType,
+    StructField,
+    IntegerType,
+    StringType,
+    ArrayType,
+    DoubleType,
+    MapType,
+)
+
+# COMMAND ----------
+
+def validate_asset_parameter_mapping(logger, rules_df):
+    """
+    Validates that asset_parameter mapping is consistent with asset_id array.
+    Ensures all assets in asset_id have entries in asset_parameter map.
+    """
+    try:
+        logger.info("Validating asset_parameter consistency...")
+        
+        # Check if all asset_ids have corresponding entries in asset_parameter
+        from pyspark.sql.functions import size as array_size
+        
+        validation_df = rules_df.withColumn(
+            "asset_id_count", array_size(col("asset_id"))
+        ).withColumn(
+            "asset_param_count", array_size(map_keys(col("asset_parameter")))
+        )
+        
+        # Find mismatches
+        mismatched = validation_df.filter(
+            col("asset_id_count") != col("asset_param_count")
+        )
+        
+        if mismatched.count() > 0:
+            logger.warning(f"Found {mismatched.count()} rules with asset_parameter mismatches")
+            mismatched.select(
+                "rule_id", "condition_id", "asset_id", "asset_parameter"
+            ).show(truncate=False)
+            return False
+        
+        logger.info("Asset_parameter validation passed")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in validate_asset_parameter_mapping(): {str(e)}")
+        return False
+
+# COMMAND ----------
+
+def generate_execution_summary(spark, logger, bronze_statistical_combined_rules_table):
+    """
+    Generates a summary report of execution combinations for review.
+    """
+    try:
+        logger.info("Generating execution summary...")
+        
+        combined_df = read_table(spark, logger, bronze_statistical_combined_rules_table)
+        
+        summary = combined_df.groupBy("rule_id", "join_condition", "execution_logic").agg(
+            count("*").alias("num_combinations"),
+            collect_list("combination_id").alias("combination_ids"),
+            array_size(collect_list("combination_id")).alias("total_combinations")
+        )
+        
+        logger.info("Execution Summary:")
+        summary.show(truncate=False)
+        
+        # Detailed view for AND logic rules
+        logger.info("Detailed view of AND logic rules:")
+        and_rules = combined_df.filter(col("execution_logic") == "INTERSECT_ALL")
+        and_rules.select(
+            "rule_id",
+            "combination_id",
+            "asset_id",
+            "parameter",
+            array_size(col("asset_id")).alias("num_assets"),
+            array_size(col("parameter")).alias("num_parameters")
+        ).show(truncate=False)
+        
+        # Detailed view for OR logic rules
+        logger.info("Detailed view of OR logic rules (sample):")
+        or_rules = combined_df.filter(col("execution_logic") == "INDEPENDENT").limit(10)
+        or_rules.select(
+            "rule_id",
+            "combination_id",
+            "asset_id",
+            "parameter"
+        ).show(truncate=False)
+        
+        return summary
+        
+    except Exception as e:
+        logger.error(f"Error in generate_execution_summary(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Testing and Validation Functions
+
+# COMMAND ----------
+
+def test_apply_join_condition():
+    """
+    Unit test for apply_join_condition_statistical function.
+    """
+    from pyspark.sql import Row
+    
+    # Create test data
+    test_data = [
+        Row(
+            rule_id=1,
+            rule_name="Test Rule",
+            tenant_id="test-tenant",
+            condition_id=1,
+            condition_name="Test Condition",
+            asset_id=["PTG-001", "PTG-002"],
+            asset_parameter={"PTG-001": ["pressure", "temperature"], "PTG-002": ["temperature"]},
+            join_condition="and",
+            operator=">",
+            threshold=100.0,
+            duration=1800,
+            function="z-score",
+            operation="create"
+        )
+    ]
+    
+    test_df = spark.createDataFrame(test_data)
+    
+    # Apply function
+    result_df = apply_join_condition_statistical(logger, test_df)
+    
+    # Validate results
+    print(f"Input rows: {test_df.count()}")
+    print(f"Output rows: {result_df.count()}")
+    print("\nOutput schema:")
+    result_df.printSchema()
+    print("\nOutput data:")
+    result_df.select("rule_id", "asset_id", "asset_parameter", "parameter", "join_condition").show(truncate=False)
+    
+    # Expected: 3 rows (PTG-001 pressure, PTG-001 temperature, PTG-002 temperature)
+    expected_count = 3
+    actual_count = result_df.count()
+    
+    if actual_count == expected_count:
+        print(f"✓ Test PASSED: Expected {expected_count} rows, got {actual_count}")
+    else:
+        print(f"✗ Test FAILED: Expected {expected_count} rows, got {actual_count}")
+    
+    return result_df
+
+# COMMAND ----------
+
+def create_test_statistical_rule_json():
+    """
+    Creates a sample statistical rule JSON for testing.
+    """
+    test_json = {
+        "rule_id": 9999,
+        "rule_name": "Test Statistical Rule",
+        "rule_type": "script",
+        "tenant_id": "test-tenant-id",
+        "join_condition": "AND",  # Root level join_condition
+        "conditions": [
+            {
+                "condition_id": 1,
+                "condition_name": "Multi-sensor Z-score check",
+                "asset_id": ["PTG-001", "PTG-002", "PTG-003"],
+                "asset_parameters": {
+                    "PTG-001": ["pressure", "temperature"],
+                    "PTG-002": ["temperature"],
+                    "PTG-003": ["pressure"]
+                },
+                "operator": ">",
+                "class": None,
+                "threshold": 3.0,
+                "duration": 1800,
+                "wire": None,
+                "function": "z-score",
+                "wireLengthFrom": None,
+                "wireLengthTo": None,
+                "rule_run_frequency": 300,
+                "sensor_type": "pt_gauge",
+                "severity": "high",
+                "baseline_time": 0,
+                "threshold_unit": "std",
+                "additional_properties": {
+                    "zscore_threshold": 3,
+                    "window_size": 100
+                },
+                "risk_register_controls": [1, 2, 3],
+                "path": "/dbfs/scripts/zscore_anomaly.py"
+            }
+        ],
+        "operation": "create"
+    }
+    
+    import json
+    print("Sample Statistical Rule JSON:")
+    print(json.dumps(test_json, indent=2))
+    
+    return test_json
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Test Code for Loading JSON
+
+# COMMAND ----------
+
+def test_load_json_from_string():
+    """
+    Test function to load JSON string into DataFrame properly.
+    This handles the MAP column issue.
+    """
+    
+    rules_json = """
+{
+  "rule_id": 1,
+  "rule_name": "rule1",
+  "rule_type": "script",
+  "tenant_id": "20976703-b49e-426f-a654-4632742c6589",
+  "join_condition": "AND",
+  "conditions": [
+    {
+      "condition_id": 1,
+      "condition_name": "condition1",
+      "asset_id": ["PTG-001"],
+      "asset_parameters": {
+        "PTG-001": ["pressure", "temperature"]
+      },
+      "operator": ">",
+      "class": null,
+      "threshold": 100,
+      "duration": 1800,
+      "wire": "1",
+      "function": "z-score",
+      "wireLengthFrom": 1000,
+      "wireLengthTo": 2000,
+      "rule_run_frequency": 1,
+      "sensor_type": "dss",
+      "severity": "high",
+      "baseline_time": 0,
+      "threshold_unit": "psu",
+      "additional_properties": {"zscore_threshold": 34},
+      "risk_register_controls": [5],
+      "path": "/path/to/python"
+    }
+  ],
+  "operation": "create"
+}
+"""
+    
+    # Define schema
+    conditions_schema = StructType([
+        StructField("condition_id", IntegerType(), True),
+        StructField("condition_name", StringType(), True),
+        StructField("asset_id", ArrayType(StringType()), True),
+        StructField("asset_parameters", MapType(StringType(), ArrayType(StringType())), True),
+        StructField("join_condition", StringType(), True),
+        StructField("operator", StringType(), True),
+        StructField("class", IntegerType(), True),
+        StructField("threshold", DoubleType(), True),
+        StructField("duration", IntegerType(), True),
+        StructField("wire", StringType(), True),
+        StructField("function", StringType(), True),
+        StructField("wireLengthFrom", IntegerType(), True),
+        StructField("wireLengthTo", IntegerType(), True),
+        StructField("rule_run_frequency", IntegerType(), True),
+        StructField("sensor_type", StringType(), True),
+        StructField("severity", StringType(), True),
+        StructField("baseline_time", IntegerType(), True),
+        StructField("threshold_unit", StringType(), True),
+        StructField("additional_properties", MapType(StringType(), IntegerType()), True),
+        StructField("risk_register_controls", ArrayType(IntegerType()), True),
+        StructField("path", StringType(), True)
+    ])
+    
+    schema = StructType([
+        StructField("rule_id", IntegerType(), True),
+        StructField("rule_name", StringType(), True),
+        StructField("rule_type", StringType(), True),
+        StructField("tenant_id", StringType(), True),
+        StructField("join_condition", StringType(), True),
+        StructField("conditions", ArrayType(conditions_schema), True),
+        StructField("operation", StringType(), True)
+    ])
+    
+    # Load JSON
+    rules_df = spark.read.json(sc.parallelize([rules_json]), schema)
+    
+    print("Successfully loaded JSON into DataFrame")
+    print(f"Row count: {rules_df.count()}")
+    
+    # Display schema
+    print("\nSchema:")
+    rules_df.printSchema()
+    
+    # Show data
+    print("\nData:")
+    rules_df.select("rule_id", "rule_name", "join_condition", "operation").show(truncate=False)
+    
+    # Test explode_statistical_conditions
+    print("\n=== Testing explode_statistical_conditions ===")
+    exploded_df = explode_statistical_conditions(logger, rules_df)
+    print(f"After explosion, row count: {exploded_df.count()}")
+    exploded_df.select("rule_id", "condition_id", "asset_id", "asset_parameter", "join_condition").show(truncate=False)
+    
+    # Test apply_join_condition_statistical
+    print("\n=== Testing apply_join_condition_statistical ===")
+    result_df = apply_join_condition_statistical(logger, exploded_df)
+    print(f"After join condition, row count: {result_df.count()}")
+    result_df.select("rule_id", "asset_id", "asset_parameter", "parameter", "join_condition").show(truncate=False)
+    
+    return rules_df
+
+# COMMAND ----------
+
+def create_statistical_combined_rules(
+    spark,
+    logger,
+    bronze_statistical_rules_table,
+    bronze_statistical_combined_rules_table
+):
+    """
+    Creates combined rules table for statistical rules execution.
+    Handles AND/OR logic by grouping asset:parameter combinations appropriately.
+    
+    For OR logic: Each combination is independent (UNION)
+    For AND logic: All combinations must fire together (INTERSECT)
+    """
+    try:
+        logger.info("Reading statistical rules table...")
+        rules_df = read_table(spark, logger, bronze_statistical_rules_table)
+        
+        logger.info("Creating execution groups for statistical rules...")
+        
+        # Get unique rules to process
+        unique_rules = rules_df.select("rule_id", "join_condition").distinct()
+        
+        all_combinations = []
+        
+        for rule_row in unique_rules.collect():
+            rule_id = rule_row.rule_id
+            join_condition = rule_row.join_condition
+            
+            # Get all rows for this rule
+            rule_specific_df = rules_df.filter(col("rule_id") == rule_id)
+            
+            # Collect all asset:parameter combinations with their queries
+            combinations = rule_specific_df.select(
+                "rule_id",
+                "condition_id", 
+                "asset_id",
+                "asset_parameter",
+                "parameter",
+                "query",
+                "join_condition"
+            ).collect()
+            
+            if join_condition == "or":
+                # OR logic: Each asset:parameter combination is independent
+                # Each gets its own execution group
+                for idx, combo in enumerate(combinations, 1):
+                    # Wrap query to ensure it returns start_time
+                    wrapped_query = f"SELECT {get_timestamp_column_for_table(get_table_name_for_parameter(combo.parameter))} as start_time FROM ({combo.query}) subquery"
+                    
+                    all_combinations.append({
+                        "rule_id": combo.rule_id,
+                        "combination_id": idx,
+                        "condition_id": [combo.condition_id],
+                        "asset_id": combo.asset_id,
+                        "asset_parameter": combo.asset_parameter,
+                        "parameter": [combo.parameter],
+                        "join_condition": "or",
+                        "combined_query": wrapped_query,
+                        "execution_logic": "INDEPENDENT"
+                    })
+            
+            elif join_condition == "and":
+                # AND logic: All asset:parameter combinations must fire together
+                # Create one execution group containing all combinations
+                asset_ids = []
+                asset_params = {}
+                parameters = []
+                condition_ids = []
+                queries = []
+                
+                for combo in combinations:
+                    asset_ids.extend(combo.asset_id)
+                    asset_params.update(combo.asset_parameter)
+                    parameters.append(combo.parameter)
+                    condition_ids.append(combo.condition_id)
+                    
+                    # Get table info for this parameter
+                    table_name = get_table_name_for_parameter(combo.parameter)
+                    timestamp_col = get_timestamp_column_for_table(table_name)
+                    
+                    # Wrap each query to return start_time
+                    wrapped = f"SELECT {timestamp_col} as start_time FROM ({combo.query}) sq_{combo.condition_id}"
+                    queries.append(wrapped)
+                
+                # Create combined query with INTERSECT logic
+                combined_query = " INTERSECT ".join(queries)
+                
+                all_combinations.append({
+                    "rule_id": rule_id,
+                    "combination_id": 1,
+                    "condition_id": list(set(condition_ids)),
+                    "asset_id": list(set(asset_ids)),
+                    "asset_parameter": asset_params,
+                    "parameter": list(set(parameters)),
+                    "join_condition": "and",
+                    "combined_query": combined_query,
+                    "execution_logic": "INTERSECT_ALL"
+                })
+        
+        logger.info(f"Created {len(all_combinations)} execution combinations")
+        
+        # Create DataFrame from combinations
+        combined_schema = StructType([
+            StructField("rule_id", IntegerType(), True),
+            StructField("combination_id", IntegerType(), True),
+            StructField("condition_id", ArrayType(IntegerType()), True),
+            StructField("asset_id", ArrayType(StringType()), True),
+            StructField("asset_parameter", MapType(StringType(), ArrayType(StringType())), True),
+            StructField("parameter", ArrayType(StringType()), True),
+            StructField("join_condition", StringType(), True),
+            StructField("combined_query", StringType(), True),
+            StructField("execution_logic", StringType(), True)
+        ])
+        
+        combined_df = spark.createDataFrame(
+            [Row(**combo) for combo in all_combinations],
+            schema=combined_schema
+        ).withColumn("last_updated_date", current_timestamp())
+        
+        # Write to combined rules table
+        logger.info(f"Writing to {bronze_statistical_combined_rules_table}...")
+        
+        # First, delete existing rules
+        try:
+            delta_table = read_delta_table(spark, logger, bronze_statistical_combined_rules_table)
+            rule_ids_to_delete = combined_df.select("rule_id").distinct().collect()
+            rule_ids_list = [row.rule_id for row in rule_ids_to_delete]
+            
+            if rule_ids_list:
+                delta_table.delete(col("rule_id").isin(rule_ids_list))
+                logger.info(f"Deleted existing rules from {bronze_statistical_combined_rules_table}")
+        except Exception as e:
+            logger.warning(f"Could not delete existing rules: {str(e)}")
+        
+        # Insert new rules
+        write_table(logger, combined_df, "append", bronze_statistical_combined_rules_table)
+        
+        logger.info("Statistical combined rules created successfully")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error in create_statistical_combined_rules(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+# MAGIC %run ../utils/logger
+
+# COMMAND ----------
+
+# MAGIC %run ../utils/read_utility
+
+# COMMAND ----------
+
+# MAGIC %run ../utils/write_utility
+
+# COMMAND ----------
+
+# MAGIC %run ../utils/file_metadata_utility
+
+# COMMAND ----------
+
+try:
+    if dbutils:
+        pass  # pragma: no cover
+except NameError:
+    from src.utils.file_metadata_utility import add_epoch_timestamp
+    from src.utils.read_utility import read_json, read_delta_table, read_table
+    from src.utils.write_utility import write_table
+
+# COMMAND ----------
+
+# Statistical function mapping
+STATISTICAL_FUNCTION_MAPPING = {
+    "z-score": "zscore",
+    "z_score": "zscore",
+    "zscore": "zscore",
+    "moving_average": "moving_avg",
+    "moving average": "moving_avg",
+    "exponential_smoothing": "exp_smooth",
+    "exponential smoothing": "exp_smooth",
+}
+
+# COMMAND ----------
+
+def get_statistical_rules_df(spark, logger, source_file_list):
+    """
+    Reads statistical rules from JSON files and returns a dataframe.
+    Handles join_condition at both root level and condition level.
+    """
+    try:
+        logger.info(f"Reading the source files: {source_file_list}")
+        
+        conditions_schema = StructType([
+            StructField("condition_id", IntegerType(), True),
+            StructField("condition_name", StringType(), True),
+            StructField("asset_id", ArrayType(StringType()), True),
+            StructField("asset_parameters", MapType(StringType(), ArrayType(StringType())), True),
+            StructField("join_condition", StringType(), True),  # Can be at condition level
+            StructField("operator", StringType(), True),
+            StructField("class", IntegerType(), True),
+            StructField("threshold", DoubleType(), True),
+            StructField("duration", IntegerType(), True),
+            StructField("wire", StringType(), True),
+            StructField("function", StringType(), True),
+            StructField("wireLengthFrom", IntegerType(), True),
+            StructField("wireLengthTo", IntegerType(), True),
+            StructField("rule_run_frequency", IntegerType(), True),
+            StructField("sensor_type", StringType(), True),
+            StructField("severity", StringType(), True),
+            StructField("baseline_time", IntegerType(), True),
+            StructField("threshold_unit", StringType(), True),
+            StructField("additional_properties", MapType(StringType(), IntegerType()), True),
+            StructField("risk_register_controls", ArrayType(IntegerType()), True),
+            StructField("path", StringType(), True),
+        ])
+
+        schema = StructType([
+            StructField("rule_id", IntegerType(), True),
+            StructField("rule_name", StringType(), True),
+            StructField("rule_type", StringType(), True),
+            StructField("tenant_id", StringType(), True),
+            StructField("join_condition", StringType(), True),  # Can be at root level
+            StructField("conditions", ArrayType(conditions_schema), True),
+            StructField("operation", StringType(), True),
+        ])
+
+        rules_df = read_json(spark, logger, source_file_list, schema).withColumn(
+            "input_file", input_file_name()
+        )
+
+        return rules_df
+
+    except Exception as e:
+        logger.error(f"Error in get_statistical_rules_df(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def keep_latest_statistical_rules(logger, rules_df):
+    """
+    Keeps only the latest record for each rule_id based on epoch timestamp 
+    extracted from file name.
+    """
+    try:
+        rules_df = add_epoch_timestamp(logger, rules_df)
+        window_spec = Window.partitionBy("rule_id").orderBy(desc("epoch_timestamp"))
+
+        # Use dropDuplicates instead of distinct to avoid MAP column issues
+        rules_df = (
+            rules_df.withColumn("row_num", row_number().over(window_spec))
+            .where(col("row_num") == 1)
+            .drop("row_num", "epoch_timestamp")
+        )
+
+        return rules_df
+
+    except Exception as e:
+        logger.error(f"Error in keep_latest_statistical_rules(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def delete_statistical_rules(spark, logger, rules_df, bronze_table_name):
+    """
+    Deletes rules from the statistical_rules bronze table for records 
+    with operation as delete.
+    """
+    try:
+        # Filter for delete operations - avoid using distinct() on MAP columns
+        rules_delete_df = rules_df.filter(
+            lower(trim(col("operation"))) == "delete"
+        ).select("rule_id").dropDuplicates()  # Only select rule_id to avoid MAP column issues
+
+        if rules_delete_df.count() > 0:
+            logger.info("Found rules to Delete. Deleting the rules from delta table...")
+            rules_dt = read_delta_table(spark, logger, bronze_table_name)
+
+            (
+                rules_dt.alias("target")
+                .merge(
+                    rules_delete_df.alias("source"), 
+                    "target.rule_id = source.rule_id"
+                )
+                .whenMatchedDelete()
+                .execute()
+            )
+        else:
+            logger.info("No rules to delete...")
+
+    except Exception as e:
+        logger.error(f"Error in delete_statistical_rules(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def explode_statistical_conditions(logger, rules_df):
+    """
+    Explodes conditions and extracts all fields including asset_parameters,
+    additional_properties, and path.
+    """
+    try:
+        logger.info("Extracting the create/update rules...")
+        # Use select on rule_id only to avoid MAP column issues with distinct
+        create_update_rule_ids = rules_df.filter(
+            col("operation") != "delete"
+        ).select("rule_id").dropDuplicates()
+        
+        create_update_rules_df = rules_df.join(
+            create_update_rule_ids, 
+            on="rule_id", 
+            how="inner"
+        )
+
+        logger.info("Exploding conditions column and extracting values...")
+        create_update_rules_df = (
+            create_update_rules_df
+            .withColumn("conditions", explode(col("conditions")))
+            .withColumn("condition_id", col("conditions.condition_id"))
+            .withColumn("condition_name", col("conditions.condition_name"))
+            .withColumn("asset_id", col("conditions.asset_id"))
+            .withColumn("asset_parameter", col("conditions.asset_parameters"))
+            .withColumn("join_condition", 
+                when(col("conditions.join_condition").isNotNull(), 
+                     col("conditions.join_condition"))
+                .otherwise(col("join_condition"))  # Use root-level if not in condition
+            )
+            .withColumn("operator", col("conditions.operator"))
+            .withColumn("class", col("conditions.class"))
+            .withColumn("threshold", col("conditions.threshold"))
+            .withColumn("duration", col("conditions.duration"))
+            .withColumn("wire", col("conditions.wire"))
+            .withColumn("function", col("conditions.function"))
+            .withColumn("wire_length_from", col("conditions.wireLengthFrom"))
+            .withColumn("wire_length_to", col("conditions.wireLengthTo"))
+            .withColumn("rule_run_frequency", col("conditions.rule_run_frequency"))
+            .withColumn("sensor_type", col("conditions.sensor_type"))
+            .withColumn("severity", col("conditions.severity"))
+            .withColumn("baseline_time", col("conditions.baseline_time"))
+            .withColumn("threshold_unit", col("conditions.threshold_unit"))
+            .withColumn("additional_properties", col("conditions.additional_properties"))
+            .withColumn("risk_register_controls", col("conditions.risk_register_controls"))
+            .withColumn("path", col("conditions.path"))
+            .withColumn("query", lit("query"))  # Placeholder for query generation
+            .withColumn("last_updated_date", current_timestamp())
+            .drop("conditions")
+        )
+
+        return create_update_rules_df
+
+    except Exception as e:
+        logger.error(f"Error in explode_statistical_conditions(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def apply_join_condition_statistical(logger, rules_df):
+    """
+    Applies join condition logic for statistical rules.
+    
+    For OR condition: Creates one row per asset:parameter combination (exploded)
+    For AND condition: Keeps all assets together in one row per parameter
+    
+    The parameter column is set to the specific parameter value for each row.
+    """
+    try:
+        # Normalize join_condition
+        rules_df = rules_df.withColumn(
+            "join_condition",
+            when(
+                col("join_condition").isNull() | (lower(col("join_condition")) == ""),
+                "or"
+            ).otherwise(lower(trim(col("join_condition"))))
+        )
+
+        logger.info("Applying join condition logic with asset_parameter mapping...")
+        
+        from pyspark.sql.functions import explode as spark_explode, map_entries
+        
+        # Split into OR and AND dataframes
+        rules_or_df = rules_df.filter(col("join_condition") == "or")
+        rules_and_df = rules_df.filter(col("join_condition") == "and")
+        
+        # Process OR logic: Explode to individual asset:parameter pairs
+        if rules_or_df.count() > 0:
+            logger.info("Processing OR logic - exploding to individual asset:parameter pairs...")
+            
+            # Explode asset_parameter map to get individual asset:parameter pairs
+            exploded_or_df = rules_or_df.withColumn(
+                "asset_param_entry", 
+                spark_explode(map_entries(col("asset_parameter")))
+            )
+            
+            # Further explode the parameter array for each asset
+            exploded_or_df = exploded_or_df.withColumn(
+                "asset_id_single", col("asset_param_entry.key")
+            ).withColumn(
+                "parameter_array", col("asset_param_entry.value")
+            ).withColumn(
+                "parameter", spark_explode(col("parameter_array"))
+            )
+            
+            # Create a single-entry map for each row containing only the specific asset:parameter
+            from pyspark.sql.functions import create_map
+            
+            exploded_or_df = exploded_or_df.withColumn(
+                "asset_parameter",
+                create_map(
+                    col("asset_id_single"),
+                    array(col("parameter"))
+                )
+            )
+            
+            # Set asset_id to array containing only the current asset
+            exploded_or_df = exploded_or_df.withColumn(
+                "asset_id",
+                array(col("asset_id_single"))
+            )
+            
+            # Clean up temporary columns
+            exploded_or_df = exploded_or_df.drop(
+                "asset_param_entry", 
+                "asset_id_single", 
+                "parameter_array"
+            )
+        
+        # Process AND logic: Group by parameter, keep all assets together
+        if rules_and_df.count() > 0:
+            logger.info("Processing AND logic - grouping assets by parameter...")
+            
+            # Collect all unique parameters across all assets
+            from pyspark.sql.functions import array_distinct, flatten
+            
+            exploded_and_df = rules_and_df.withColumn(
+                "all_parameters",
+                array_distinct(flatten(map_values(col("asset_parameter"))))
+            )
+            
+            # Explode parameters to create one row per unique parameter
+            exploded_and_df = exploded_and_df.withColumn(
+                "parameter",
+                spark_explode(col("all_parameters"))
+            )
+            
+            # For each parameter row, collect all assets that have this parameter
+            @udf(returnType=ArrayType(StringType()))
+            def get_assets_for_parameter(asset_param_map, param):
+                """Returns list of assets that have the given parameter"""
+                assets = []
+                for asset_id, params in asset_param_map.items():
+                    if param in params:
+                        assets.append(asset_id)
+                return sorted(assets)
+            
+            @udf(returnType=MapType(StringType(), ArrayType(StringType())))
+            def create_filtered_map(asset_param_map, param):
+                """Creates map with only assets that have the given parameter"""
+                filtered = {}
+                for asset_id, params in asset_param_map.items():
+                    if param in params:
+                        filtered[asset_id] = [param]
+                return filtered
+            
+            exploded_and_df = exploded_and_df.withColumn(
+                "asset_id",
+                get_assets_for_parameter(col("asset_parameter"), col("parameter"))
+            ).withColumn(
+                "asset_parameter",
+                create_filtered_map(col("asset_parameter"), col("parameter"))
+            )
+            
+            # Clean up temporary columns
+            exploded_and_df = exploded_and_df.drop("all_parameters")
+        
+        # Union OR and AND results
+        if rules_or_df.count() > 0 and rules_and_df.count() > 0:
+            result_df = exploded_or_df.unionByName(exploded_and_df)
+        elif rules_or_df.count() > 0:
+            result_df = exploded_or_df
+        else:
+            result_df = exploded_and_df
+        
+        logger.info(f"Successfully created {result_df.count()} rows from asset_parameter combinations")
+        
+        return result_df
+
+    except Exception as e:
+        logger.error(f"Error in apply_join_condition_statistical(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def get_statistical_rules_to_upsert(logger, rules_df, rules_dt):
+    """
+    Returns dataframe containing rules that need to be created/inserted and updated.
+    Only retains rules with create operation which are not present in the 
+    statistical_rules bronze table.
+    """
+    try:
+        rules_dt_df = rules_dt.toDF()
+
+        logger.info(
+            "Filtering rules where operation is 'create' and rule_id is not present in bronze table..."
+        )
+
+        create_src = rules_df.filter(lower(trim(col("operation"))) == "create")
+
+        rules_create_df = create_src.join(
+            rules_dt_df, 
+            create_src.rule_id == rules_dt_df.rule_id, 
+            how="left_anti"
+        )
+        
+        logger.info("Filtering rules where operation is 'update'...")
+        rules_update_df = rules_df.filter(lower(trim(col("operation"))) == "update")
+
+        return rules_create_df.unionByName(rules_update_df)
+
+    except Exception as e:
+        logger.error(f"Error in get_statistical_rules_to_upsert(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def add_data_frequency_statistical(logger, rules_df, asset_df):
+    """
+    Adds data_frequency column from asset bronze table to the rules dataframe.
+    """
+    try:
+        logger.info("Fetching asset_id and data_frequency from asset bronze table...")
+        asset_df = asset_df.select(
+            col("asset_id"), 
+            col("data_frequency")
+        ).withColumn(
+            "data_frequency", 2 * col("data_frequency") - 1
+        )
+
+        logger.info("Adding unique id to each row of rules...")
+        rules_df = rules_df.withColumn("id", monotonically_increasing_id())
+
+        # Explode the asset_id array
+        exploded_rules_df = rules_df.select(
+            "id", explode("asset_id").alias("asset_id")
+        )
+
+        logger.info("Joining rules and asset data based on asset_id...")
+        joined_df = exploded_rules_df.join(asset_df, on="asset_id", how="left")
+
+        logger.info("Collecting data frequency in a list...")
+        result_df = joined_df.groupBy("id").agg(
+            collect_list("data_frequency").alias("data_frequency"),
+            ((max("data_frequency") + 1) / 2).cast("integer").alias("max_data_frequency")
+        )
+
+        logger.info("Adding data_frequency column...")
+        result_df = rules_df.join(result_df, on="id", how="inner")
+
+        result_df = result_df.withColumn(
+            "window_slide_duration",
+            when(col("function").isin(["moving_average", "exponential_smoothing"]), 
+                 col("duration"))
+            .otherwise(lit(0))
+        )
+
+        return result_df
+
+    except Exception as e:
+        logger.error(f"Error in add_data_frequency_statistical(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+# Parameter to table mapping
+PARAMETER_TABLE_MAPPING = {
+    # PT Gauge parameters
+    "pressure": "pt_gauge",
+    "temperature": "pt_gauge",
+    
+    # Flowmeter parameters
+    "surface_flow_rate": "flowmeter",
+    "well_head_pressure": "flowmeter",
+    
+    # DSS parameters
+    "dts": "dss",
+    "distributed_temperature": "dss",
+    "axial_strain": "dss",
+    "axial_strain_thermal": "dss",
+    "bend_magnitude": "dss",
+    "bend_mag": "dss",
+    "curr_temp": "dss",
+    
+    # Microseismic parameters
+    "magnitude": "microseismic_events",
+    "no_of_events": "microseismic_events",
+    "number_of_seismic_events": "microseismic_events",
+}
+
+# Table to timestamp column mapping
+TABLE_TIMESTAMP_MAPPING = {
+    "pt_gauge": "epoch_timestamp",
+    "flowmeter": "timestamp",
+    "dss": "timestamp",
+    "microseismic_events": "epoch_timestamp",
+}
+
+# DSS parameter name mapping (from input to actual column name)
+DSS_PARAMETER_MAPPING = {
+    "axial_strain": "axial_strain_thermal",
+    "bend_magnitude": "bend_mag",
+    "dts": "curr_temp",
+    "distributed_temperature": "curr_temp",
+}
+
+# COMMAND ----------
+
+def get_table_name_for_parameter(parameter: str) -> str:
+    """
+    Returns the table name for a given parameter.
+    """
+    return PARAMETER_TABLE_MAPPING.get(parameter.lower(), "unknown_table")
+
+def get_timestamp_column_for_table(table_name: str) -> str:
+    """
+    Returns the timestamp column name for a given table.
+    """
+    return TABLE_TIMESTAMP_MAPPING.get(table_name, "timestamp")
+
+def get_actual_parameter_name(parameter: str, table_name: str) -> str:
+    """
+    Returns the actual parameter name in the table.
+    Maps input parameter names to actual column names.
+    """
+    if table_name == "dss" and parameter in DSS_PARAMETER_MAPPING:
+        return DSS_PARAMETER_MAPPING[parameter]
+    return parameter
+
+# COMMAND ----------
+
+def generate_statistical_query(logger, rules_df):
+    """
+    Generates statistical SQL query for each rule based on parameter and sensor type.
+    Creates SELECT queries that fetch data from appropriate silver zone tables.
+    
+    For OR condition: One asset per query
+    For AND condition: Multiple assets in single query using IN clause
+    
+    Query Template:
+    SELECT {parameter}, {timestamp_column}
+    FROM `{catalog}`.silver_zone.{table_name}
+    WHERE asset_id IN ('{asset_id1}', '{asset_id2}', ...)
+      AND {timestamp_column} BETWEEN $start_time AND $end_time
+      [AND additional conditions based on sensor type]
+    """
+    try:
+        logger.info("Generating statistical queries...")
+        
+        from pyspark.sql.functions import udf
+        from pyspark.sql.types import StringType
+        
+        @udf(returnType=StringType())
+        def build_statistical_query(
+            parameter: str,
+            asset_id_array: list,
+            sensor_type: str,
+            wire: str,
+            wire_length_from: int,
+            wire_length_to: int,
+            class_val: int,
+            function: str,
+            path: str
+        ) -> str:
+            """
+            Builds the statistical query based on parameter and sensor type.
+            Handles single or multiple assets.
+            """
+            # Get table name based on parameter
+            table_name = get_table_name_for_parameter(parameter)
+            
+            # Get timestamp column for this table
+            timestamp_col = get_timestamp_column_for_table(table_name)
+            
+            # Get actual parameter name in the table
+            actual_param = get_actual_parameter_name(parameter, table_name)
+            
+            # Build asset_id filter
+            if asset_id_array and len(asset_id_array) > 0:
+                if len(asset_id_array) == 1:
+                    # Single asset: use = operator
+                    asset_filter = f"asset_id = '{asset_id_array[0]}'"
+                else:
+                    # Multiple assets: use IN clause
+                    asset_list = "', '".join(asset_id_array)
+                    asset_filter = f"asset_id IN ('{asset_list}')"
+            else:
+                asset_filter = "asset_id = 'UNKNOWN'"
+            
+            # Base query template
+            base_query = f"""SELECT {actual_param}, {timestamp_col}
+FROM `$catalog`.silver_zone.{table_name}
+WHERE {asset_filter}
+  AND {timestamp_col} BETWEEN $start_time AND $end_time"""
+            
+            # Add sensor-specific conditions
+            if table_name == "dss":
+                # DSS requires wire and depth range
+                wire_val = wire if wire else "1"
+                length_from = wire_length_from if wire_length_from is not None else 0
+                length_to = wire_length_to if wire_length_to is not None else 10000
+                
+                base_query += f"""
+  AND wire = {wire_val}
+  AND depth BETWEEN {length_from} AND {length_to}"""
+            
+            elif table_name == "microseismic_events":
+                # Microseismic events may have class filter
+                if class_val is not None:
+                    base_query += f"""
+  AND class = {class_val}"""
+            
+            return base_query
+        
+        # Apply UDF to generate queries
+        rules_df = rules_df.withColumn(
+            "query",
+            build_statistical_query(
+                col("parameter"),
+                col("asset_id"),
+                col("sensor_type"),
+                col("wire"),
+                col("wire_length_from"),
+                col("wire_length_to"),
+                col("class"),
+                col("function"),
+                col("path")
+            )
+        )
+        
+        logger.info("Statistical queries generated successfully")
+        return rules_df
+
+    except Exception as e:
+        logger.error(f"Error in generate_statistical_query(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def log_error_statistical_rules(
+    logger,
+    error_rules_df,
+    bronze_error_log,
+    job_id,
+    run_id,
+    task_id,
+    workflow_name,
+    task_name,
+):
+    """
+    Logs malformed statistical rules in the error log table.
+    """
+    try:
+        if error_rules_df.count() == 0:
+            logger.info("No error rules to log...")
+            return
+
+        error_rules_df = (
+            error_rules_df.select("asset_id", "input_file", "rule_id")
+            .withColumn("workflow_job_id", lit(job_id))
+            .withColumn("run_id", lit(run_id))
+            .withColumn("task_id", lit(task_id))
+            .withColumn("workflow_name", lit(workflow_name))
+            .withColumn("task_name", lit(task_name))
+            .withColumn("source", col("input_file"))
+            .withColumn(
+                "error_message",
+                concat(
+                    lit("Data Frequency missing in asset table for asset_id(s): "),
+                    concat_ws(", ", col("asset_id")),
+                    lit(" in rule_id: "),
+                    col("rule_id")
+                )
+            )
+            .withColumn("additional_context", lit("Statistical Rule"))
+            .withColumn("last_updated_date", current_timestamp())
+            .drop("asset_id", "input_file", "rule_id")
+        )
+
+        logger.info(f"Writing malformed rules into {bronze_error_log} table...")
+        write_table(logger, error_rules_df, "append", bronze_error_log)
+
+    except Exception as e:
+        logger.error(f"Error in log_error_statistical_rules(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def delete_statistical_rules_with_update(logger, rules_df, rules_dt):
+    """
+    Deletes rules from bronze table where operation is 'update'.
+    Update is treated as delete and insert.
+    """
+    try:
+        logger.info(
+            "Deleting the rules from bronze table where operation == 'update'..."
+        )
+
+        (
+            rules_dt.alias("tgt")
+            .merge(
+                rules_df.alias("src"),
+                "src.rule_id = tgt.rule_id and src.operation = 'update'",
+            )
+            .whenMatchedDelete()
+            .execute()
+        )
+
+    except Exception as e:
+        logger.error(f"Error in delete_statistical_rules_with_update(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def write_statistical_rules(logger, rules_df, bronze_table_name):
+    """
+    Writes statistical rules to the bronze table.
+    """
+    try:
+        logger.info("Removing temporary columns...")
+        rules_df = rules_df.drop(
+            "operation", "id", "data_frequency", "input_file", "rule_type"
+        )
+
+        logger.info("Rearranging columns to match bronze table schema...")
+        rules_df = rules_df.select(
+            "rule_id",
+            "rule_name",
+            "tenant_id",
+            "condition_id",
+            "condition_name",
+            "asset_id",
+            "asset_parameter",
+            "join_condition",
+            "parameter",
+            "operator",
+            "class",
+            "threshold",
+            "duration",
+            "wire",
+            "function",
+            "wire_length_from",
+            "wire_length_to",
+            "rule_run_frequency",
+            "max_data_frequency",
+            "sensor_type",
+            "severity",
+            "risk_register_controls",
+            "baseline_time",
+            "threshold_unit",
+            "additional_properties",
+            "window_slide_duration",
+            "query",
+            "path",
+            "last_updated_date",
+        )
+
+        logger.info("Inserting statistical rules from source file...")
+        write_table(logger, rules_df, "append", bronze_table_name)
+
+    except Exception as e:
+        logger.error(f"Error in write_statistical_rules(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def create_statistical_rules_header(
+    spark,
+    logger,
+    rules_json_df,
+    bronze_table_name,
+    bronze_statistical_rules_header_table
+):
+    """
+    Creates header table for statistical rules combining relevant fields 
+    for JSON payload to s-bus.
+    """
+    try:
+        logger.info("Creating statistical rules header...")
+        
+        # Filter out delete operations
+        filtered_rules_json_df = rules_json_df.filter(
+            col("operation") != "delete"
+        ).distinct()
+
+        # Extract rule_run_frequency from conditions
+        create_update_rules_json_df = (
+            filtered_rules_json_df
+            .withColumn(
+                "rule_run_frequency_list",
+                expr("transform(conditions, x -> x.rule_run_frequency)")
+            )
+            .withColumn(
+                "rule_run_frequency",
+                array_max(col("rule_run_frequency_list"))
+            )
+            .withColumn(
+                "conditions",
+                to_json(col("conditions"), options={"ignoreNullFields": False})
+            )
+        )
+
+        # Read statistical rules table to get statistical_group_id
+        df_statistical = read_table(spark, logger, bronze_table_name)
+        
+        df_statistical_max = df_statistical.groupBy("rule_id").agg(
+            max("condition_id").alias("statistical_group_id")
+        ).distinct()
+
+        logger.info("Joining with statistical rules to get statistical_group_id...")
+        result_header_df = df_statistical_max.join(
+            create_update_rules_json_df,
+            on="rule_id",
+            how="inner"
+        ).select(
+            "rule_id",
+            "rule_name",
+            "tenant_id",
+            col("conditions.severity").alias("severity"),
+            col("conditions.join_condition").getItem(0).alias("join_condition"),
+            "statistical_group_id",
+            col("conditions.risk_register_controls").getItem(0).alias("risk_register_controls"),
+            col("conditions").alias("conditions"),
+            "rule_run_frequency",
+            current_timestamp().alias("last_updated_date")
+        )
+
+        # Read target delta table
+        target_df = read_delta_table(spark, logger, bronze_statistical_rules_header_table)
+
+        logger.info("Upserting data into statistical_rules_header table...")
+        
+        # Perform merge operation
+        (
+            target_df.alias("target")
+            .merge(
+                result_header_df.alias("source"),
+                "target.rule_id = source.rule_id"
+            )
+            .whenMatchedUpdateAll()
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+
+        logger.info("Data loaded successfully into statistical_rules_header table")
+
+    except Exception as e:
+        logger.error(f"Error in create_statistical_rules_header(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+def load_statistical_rules_bronze(
+    spark,
+    logger,
+    source_file_list,
+    bronze_table_name,
+    bronze_asset_table,
+    bronze_error_log,
+    bronze_statistical_rules_header_table,
+    bronze_statistical_combined_rules_table,
+    job_id,
+    run_id,
+    task_id,
+    workflow_name,
+    task_name,
+) -> bool:
+    """
+    Main function to load statistical rules into bronze zone.
+    Also creates combined rules for proper AND/OR execution logic.
+    """
+    try:
+        logger.info("Starting statistical rules load process...")
+        
+        # Read JSON files
+        rules_json_df = get_statistical_rules_df(spark, logger, source_file_list)
+
+        if rules_json_df.count() == 0:
+            logger.info("No statistical rules to create/update/delete...")
+            return False
+
+        # Keep latest rules
+        rules_df = keep_latest_statistical_rules(logger, rules_json_df)
+
+        # Delete rules with operation = 'delete'
+        delete_statistical_rules(spark, logger, rules_df, bronze_table_name)
+
+        # Explode conditions
+        rules_df = explode_statistical_conditions(logger, rules_df)
+
+        # Apply join condition - creates one row per asset:parameter combination
+        rules_df = apply_join_condition_statistical(logger, rules_df)
+
+        if rules_df.count() == 0:
+            logger.info("No statistical rules to create/update...")
+            return True
+
+        # Read delta table
+        rules_dt = read_delta_table(spark, logger, bronze_table_name)
+
+        # Get rules to upsert
+        rules_df = get_statistical_rules_to_upsert(logger, rules_df, rules_dt)
+
+        # Read asset table
+        asset_df = read_table(spark, logger, bronze_asset_table)
+
+        # Add data frequency
+        rules_df = add_data_frequency_statistical(logger, rules_df, asset_df)
+
+        # Separate error records
+        error_rules_df = rules_df.filter(col("data_frequency").isNull())
+        rules_df = rules_df.filter(col("data_frequency").isNotNull())
+
+        # Log errors
+        log_error_statistical_rules(
+            logger,
+            error_rules_df,
+            bronze_error_log,
+            job_id,
+            run_id,
+            task_id,
+            workflow_name,
+            task_name,
+        )
+
+        # Generate queries
+        rules_df = generate_statistical_query(logger, rules_df)
+
+        # Delete rules with update operation
+        delete_statistical_rules_with_update(logger, rules_df, rules_dt)
+
+        # Write rules to bronze
+        write_statistical_rules(logger, rules_df, bronze_table_name)
+
+        # Create combined rules for execution (handles AND/OR logic)
+        logger.info("Creating statistical combined rules for execution...")
+        create_statistical_combined_rules(
+            spark,
+            logger,
+            bronze_table_name,
+            bronze_statistical_combined_rules_table
+        )
+
+        # Create header table
+        create_statistical_rules_header(
+            spark,
+            logger,
+            rules_json_df,
+            bronze_table_name,
+            bronze_statistical_rules_header_table
+        )
+
+        logger.info("Statistical rules load process completed successfully")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error in load_statistical_rules_bronze(): {str(e)}")
+        raise
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Usage Examples and Documentation
+# MAGIC
+# MAGIC ### Input JSON Structure
+# MAGIC ```json
+# MAGIC {
+# MAGIC   "rule_id": 1,
+# MAGIC   "rule_name": "Z-Score Pressure Anomaly",
+# MAGIC   "rule_type": "script",
+# MAGIC   "tenant_id": "20976703-b49e-426f-a654-4632742c6589",
+# MAGIC   "conditions": [
+# MAGIC     {
+# MAGIC       "condition_id": 1,
+# MAGIC       "condition_name": "Multi-sensor pressure check",
+# MAGIC       "asset_id": ["PTG-001", "PTG-002"],
+# MAGIC       "asset_parameters": {
+# MAGIC         "PTG-001": ["pressure"],
+# MAGIC         "PTG-002": ["temperature"]
+# MAGIC       },
+# MAGIC       "join_condition": "AND",
+# MAGIC       "operator": ">",
+# MAGIC       "threshold": 100,
+# MAGIC       "duration": 1800,
+# MAGIC       "additional_properties": {"zscore_threshold": 3},
+# MAGIC       "path": "/path/to/zscore_script.py"
+# MAGIC     }
+# MAGIC   ],
+# MAGIC   "operation": "create"
+# MAGIC }
+# MAGIC ```
+# MAGIC
+# MAGIC ### Generated SQL Queries
+# MAGIC
+# MAGIC **For parameter="pressure" from PT Gauge:**
+# MAGIC ```sql
+# MAGIC -- Statistical Function: z-score
+# MAGIC -- Script Path: /path/to/zscore_script.py
+# MAGIC SELECT pressure, epoch_timestamp
+# MAGIC FROM `$catalog`.silver_zone.pt_gauge
+# MAGIC WHERE asset_id = 'PTG-001'
+# MAGIC   AND epoch_timestamp BETWEEN $start_time AND $end_time
+# MAGIC ```
+# MAGIC
+# MAGIC **For parameter="temperature" from PT Gauge:**
+# MAGIC ```sql
+# MAGIC -- Statistical Function: z-score
+# MAGIC -- Script Path: /path/to/zscore_script.py
+# MAGIC SELECT temperature, epoch_timestamp
+# MAGIC FROM `$catalog`.silver_zone.pt_gauge
+# MAGIC WHERE asset_id = 'PTG-002'
+# MAGIC   AND epoch_timestamp BETWEEN $start_time AND $end_time
+# MAGIC ```
+# MAGIC
+# MAGIC **For parameter="dts" from DSS:**
+# MAGIC ```sql
+# MAGIC -- Statistical Function: z-score
+# MAGIC -- Script Path: /path/to/zscore_script.py
+# MAGIC SELECT curr_temp, timestamp
+# MAGIC FROM `$catalog`.silver_zone.dss
+# MAGIC WHERE asset_id = 'DSS-001'
+# MAGIC   AND timestamp BETWEEN $start_time AND $end_time
+# MAGIC   AND wire = 1
+# MAGIC   AND depth BETWEEN 1000 AND 2000
+# MAGIC ```
+# MAGIC
+# MAGIC **For parameter="magnitude" from Microseismic Events:**
+# MAGIC ```sql
+# MAGIC -- Statistical Function: z-score
+# MAGIC -- Script Path: /path/to/zscore_script.py
+# MAGIC SELECT magnitude, epoch_timestamp
+# MAGIC FROM `$catalog`.silver_zone.microseismic_events
+# MAGIC WHERE asset_id = 'MS-001'
+# MAGIC   AND epoch_timestamp BETWEEN $start_time AND $end_time
+# MAGIC   AND class = 1
+# MAGIC ```
+# MAGIC
+# MAGIC ### Combined Query Examples
+# MAGIC
+# MAGIC **OR Logic (INDEPENDENT execution):**
+# MAGIC ```sql
+# MAGIC -- Combination 1 (PTG-001 pressure)
+# MAGIC SELECT epoch_timestamp as start_time FROM (
+# MAGIC   SELECT pressure, epoch_timestamp
+# MAGIC   FROM `$catalog`.silver_zone.pt_gauge
+# MAGIC   WHERE asset_id = 'PTG-001'
+# MAGIC     AND epoch_timestamp BETWEEN $start_time AND $end_time
+# MAGIC ) subquery
+# MAGIC
+# MAGIC -- Combination 2 (PTG-002 temperature)
+# MAGIC SELECT epoch_timestamp as start_time FROM (
+# MAGIC   SELECT temperature, epoch_timestamp
+# MAGIC   FROM `$catalog`.silver_zone.pt_gauge
+# MAGIC   WHERE asset_id = 'PTG-002'
+# MAGIC     AND epoch_timestamp BETWEEN $start_time AND $end_time
+# MAGIC ) subquery
+# MAGIC
+# MAGIC -- Engine executes each independently, UNION results
+# MAGIC ```
+# MAGIC
+# MAGIC **AND Logic (INTERSECT_ALL execution):**
+# MAGIC ```sql
+# MAGIC -- Combined query with INTERSECT
+# MAGIC SELECT epoch_timestamp as start_time FROM (
+# MAGIC   SELECT pressure, epoch_timestamp
+# MAGIC   FROM `$catalog`.silver_zone.pt_gauge
+# MAGIC   WHERE asset_id = 'PTG-001'
+# MAGIC     AND epoch_timestamp BETWEEN $start_time AND $end_time
+# MAGIC ) sq_1
+# MAGIC INTERSECT
+# MAGIC SELECT epoch_timestamp as start_time FROM (
+# MAGIC   SELECT temperature, epoch_timestamp
+# MAGIC   FROM `$catalog`.silver_zone.pt_gauge
+# MAGIC   WHERE asset_id = 'PTG-002'
+# MAGIC     AND epoch_timestamp BETWEEN $start_time AND $end_time
+# MAGIC ) sq_2
+# MAGIC
+# MAGIC -- Returns only timestamps where BOTH conditions are met
+# MAGIC ```
+# MAGIC
+# MAGIC ### Parameter to Table Mapping
+# MAGIC
+# MAGIC | Parameter | Table | Timestamp Column | Notes |
+# MAGIC |-----------|-------|------------------|-------|
+# MAGIC | pressure | pt_gauge | epoch_timestamp | - |
+# MAGIC | temperature | pt_gauge | epoch_timestamp | - |
+# MAGIC | surface_flow_rate | flowmeter | timestamp | - |
+# MAGIC | well_head_pressure | flowmeter | timestamp | - |
+# MAGIC | dts | dss | timestamp | Maps to curr_temp column |
+# MAGIC | distributed_temperature | dss | timestamp | Maps to curr_temp column |
+# MAGIC | axial_strain | dss | timestamp | Maps to axial_strain_thermal |
+# MAGIC | bend_magnitude | dss | timestamp | Maps to bend_mag column |
+# MAGIC | magnitude | microseismic_events | epoch_timestamp | Can filter by class |
+# MAGIC | no_of_events | microseismic_events | epoch_timestamp | Can filter by class |
+# MAGIC
+# MAGIC ### How asset_parameter Mapping Works
+# MAGIC
+# MAGIC **Input:**
+# MAGIC - asset_parameters: {"PTG-001": ["pressure"], "PTG-002": ["temperature"]}
+# MAGIC - join_condition: "AND"
+# MAGIC
+# MAGIC **Output Rows:**
+# MAGIC 1. Row 1: asset_id=["PTG-001"], asset_parameter={"PTG-001": ["pressure"]}, parameter="pressure"
+# MAGIC 2. Row 2: asset_id=["PTG-002"], asset_parameter={"PTG-002": ["temperature"]}, parameter="temperature"
+# MAGIC
+# MAGIC **Generated Queries:**
+# MAGIC 1. Query 1: SELECT pressure, epoch_timestamp FROM pt_gauge WHERE asset_id='PTG-001'...
+# MAGIC 2. Query 2: SELECT temperature, epoch_timestamp FROM pt_gauge WHERE asset_id='PTG-002'...
+# MAGIC
+# MAGIC ### Execution Logic
+# MAGIC
+# MAGIC **OR Logic (join_condition = "or"):**
+# MAGIC - Each asset:parameter combination is independent
+# MAGIC - Anomaly detected if ANY combination triggers
+# MAGIC - Execution: `Query1 UNION Query2 UNION Query3`
+# MAGIC
+# MAGIC **AND Logic (join_condition = "and"):**
+# MAGIC - All asset:parameter combinations must trigger together
+# MAGIC - Anomaly detected if ALL combinations trigger simultaneously
+# MAGIC - Execution: `Query1 INTERSECT Query2 INTERSECT Query3`
+# MAGIC
+# MAGIC ### Statistical Combined Rules Table
+# MAGIC
+# MAGIC The `statistical_combined_rules` table contains execution-ready queries:
+# MAGIC
+# MAGIC | rule_id | combination_id | condition_id | asset_id | parameter | combined_query | execution_logic |
+# MAGIC |---------|---------------|--------------|----------|-----------|----------------|-----------------|
+# MAGIC | 1 | 1 | [1] | ["PTG-001", "PTG-002"] | ["pressure", "temperature"] | (Query1) INTERSECT (Query2) | INTERSECT_ALL |
+# MAGIC | 2 | 1 | [1] | ["PTG-001"] | ["pressure"] | Query1 | INDEPENDENT |
+# MAGIC | 2 | 2 | [1] | ["PTG-002"] | ["temperature"] | Query2 | INDEPENDENT |
+# MAGIC
+# MAGIC ### Call Example
+# MAGIC
+# MAGIC ```python
+# MAGIC result = load_statistical_rules_bronze(
+# MAGIC     spark=spark,
+# MAGIC     logger=logger,
+# MAGIC     source_file_list=["dbfs:/mnt/data/rules/*.json"],
+# MAGIC     bronze_table_name="bronze_zone.statistical_rules",
+# MAGIC     bronze_asset_table="bronze_zone.asset",
+# MAGIC     bronze_error_log="bronze_zone.error_log",
+# MAGIC     bronze_statistical_rules_header_table="bronze_zone.statistical_rules_header",
+# MAGIC     bronze_statistical_combined_rules_table="bronze_zone.statistical_combined_rules",
+# MAGIC     job_id="12345",
+# MAGIC     run_id="67890",
+# MAGIC     task_id="task_001",
+# MAGIC     workflow_name="statistical_rules_workflow",
+# MAGIC     task_name="load_statistical_rules"
+# MAGIC )
+# MAGIC ```:**
+# MAGIC - Each asset:parameter combination is independent
+# MAGIC - Anomaly detected if ANY combination triggers
+# MAGIC - Execution: `Query1 UNION Query2 UNION Query3`
+# MAGIC
+# MAGIC **AND Logic (join_condition = "and"):**
+# MAGIC - All asset:parameter combinations must trigger together
+# MAGIC - Anomaly detected if ALL combinations trigger simultaneously
+# MAGIC - Execution: `Query1 INTERSECT Query2 INTERSECT Query3`
+# MAGIC
+# MAGIC ### Statistical Combined Rules Table
+# MAGIC
+# MAGIC The `statistical_combined_rules` table contains execution-ready queries:
+# MAGIC
+# MAGIC | rule_id | combination_id | condition_id | asset_id | parameter | combined_query | execution_logic |
+# MAGIC |---------|---------------|--------------|----------|-----------|----------------|-----------------|
+# MAGIC | 1 | 1 | [1] | ["PTG-001", "PTG-002"] | ["pressure", "temperature"] | (Query1) INTERSECT (Query2) | INTERSECT_ALL |
+# MAGIC | 2 | 1 | [1] | ["PTG-001"] | ["pressure"] | Query1 | INDEPENDENT |
+# MAGIC | 2 | 2 | [1] | ["PTG-002"] | ["temperature"] | Query2 | INDEPENDENT |
+# MAGIC
+# MAGIC ### Call Example
+# MAGIC
+# MAGIC ```python
+# MAGIC result = load_statistical_rules_bronze(
+# MAGIC     spark=spark,
+# MAGIC     logger=logger,
+# MAGIC     source_file_list=["dbfs:/mnt/data/rules/*.json"],
+# MAGIC     bronze_table_name="bronze_zone.statistical_rules",
+# MAGIC     bronze_asset_table="bronze_zone.asset",
+# MAGIC     bronze_error_log="bronze_zone.error_log",
+# MAGIC     bronze_statistical_rules_header_table="bronze_zone.statistical_rules_header",
+# MAGIC     bronze_statistical_combined_rules_table="bronze_zone.statistical_combined_rules",
+# MAGIC     job_id="12345",
+# MAGIC     run_id="67890",
+# MAGIC     task_id="task_001",
+# MAGIC     workflow_name="statistical_rules_workflow",
+# MAGIC     task_name="load_statistical_rules"
+# MAGIC )
+# MAGIC ```
