@@ -3,3 +3,6 @@
 Deduplicate [conditions#13218, tenant_id#13216, rule_id#13213, join_condition#13217, rule_type#13215, operation#13219, rule_name#13214]
 +- Filter NOT (operation#13219 = delete)
    +- LogicalRDD [rule_id#13213, rule_name#13214, rule_type#13215, tenant_id#13216, join_condition#13217, conditions#13218, operation#13219], false
+
+
+[UNSUPPORTED_FEATURE.SET_OPERATION_ON_MAP_TYPE] The feature is not supported: Cannot have MAP type columns in DataFrame which calls set operations (INTERSECT, EXCEPT, etc.), but the type of column `conditions` is "ARRAY<STRUCT<condition_id: INT, condition_name: STRING, asset_id: ARRAY<STRING>, asset_parameters: MAP<STRING, ARRAY<STRING>>, join_condition: STRING, operator: STRING, class: INT, threshold: DOUBLE, duration: INT, wire: STRING, function: STRING, wireLengthFrom: INT, wireLengthTo: INT, rule_run_frequency: INT, sensor_type: STRING, severity: STRING, baseline_time: INT, threshold_unit: STRING, additional_properties: MAP<STRING, INT>, risk_register_controls: ARRAY<INT>, path: STRING>>". SQLSTATE: 0A000
